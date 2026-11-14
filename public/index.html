@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Coding On Drugs</title>
+  <link rel="stylesheet" href="styles.css?v=11" />
+  <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
+</head>
+<body>
+  <div id="ide-shell">
+    <!-- Clean Top Titlebar (PyCharm-style centered Run & Stop) -->
+    <header id="titlebar">
+      <div class="titlebar-left">
+        <div class="brand">
+          <span class="brand-dot"></span>
+          <span class="brand-name">CODING ON DRUGS</span>
+        </div>
+      </div>
+
+      <div class="titlebar-center">
+        <button id="btn-compile" class="pycharm-icon-btn pycharm-run" title="Run 'main.py' (Ctrl+Enter)">
+          <svg viewBox="0 0 16 16" width="16" height="16">
+            <path d="M3.5 2.5L13 8L3.5 13.5V2.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <button id="btn-stop" class="pycharm-icon-btn pycharm-stop" title="Stop 'main.py'">
+          <svg viewBox="0 0 16 16" width="16" height="16">
+            <rect x="3" y="3" width="10" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="toolbar-actions">
+        <div class="export-dropdown">
+          <button id="btn-export-menu" class="btn btn-ghost">⬇ Export ▾</button>
+          <div id="export-menu" class="dropdown-menu">
+            <button id="btn-export-exe">🖥️ Download Windows .EXE</button>
+            <button id="btn-export-zip">📦 Download Project .ZIP</button>
+            <button id="btn-share-link">🔗 Copy Shareable Web Link</button>
+          </div>
+        </div>
+        <button id="btn-toggle-preview" class="btn btn-ghost" title="Toggle Preview Pane">◫ Preview</button>
+      </div>
+    </header>
+
+    <!-- Main Body -->
+    <div id="main-area">
+      <!-- Activity Bar -->
+      <aside id="activity-bar">
+        <button class="act-btn active" data-side="explorer" title="Project Files">
+          <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">
+            <path d="M1.5 3.5h4.2l1.6 1.8h7.2v7.2h-13V3.5z"/>
+          </svg>
+        </button>
+        <button class="act-btn" data-side="repos" title="Repositories">
+          <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="4.5" cy="3.5" r="1.5"/>
+            <circle cx="4.5" cy="12.5" r="1.5"/>
+            <circle cx="11.5" cy="6.5" r="1.5"/>
+            <path d="M4.5 5v6M11.5 8c0 2.5-3 2.5-7 3"/>
+          </svg>
+        </button>
+        <button class="act-btn" data-side="accounts" title="IDE Settings">
+          <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+            <line x1="2" y1="4" x2="14" y2="4"/>
+            <circle cx="5.5" cy="4" r="1.6" fill="#181a1f"/>
+            <line x1="2" y1="8" x2="14" y2="8"/>
+            <circle cx="10.5" cy="8" r="1.6" fill="#181a1f"/>
+            <line x1="2" y1="12" x2="14" y2="12"/>
+            <circle cx="6.5" cy="12" r="1.6" fill="#181a1f"/>
+          </svg>
+        </button>
+      </aside>
+
+      <!-- Sidebar -->
+      <aside id="sidebar">
+        <div class="side-pane active" id="side-explorer">
+          <div class="side-header side-header-row">
+            <span id="explorer-repo-label">WORKSPACE</span>
+            <div class="side-header-actions">
+              <button id="btn-new-file" class="btn-mini" title="Create a new .py file">+ New .py</button>
+            </div>
+          </div>
+          <div id="new-file-box" class="new-file-box" style="display:none;">
+            <input id="new-file-input" type="text" placeholder="File name (e.g. v2.py)" />
+            <div class="btn-row" style="justify-content:flex-end;">
+              <button id="btn-new-file-cancel" class="btn-mini">Cancel</button>
+              <button id="btn-new-file-create" class="btn-mini active">Create</button>
+            </div>
+          </div>
+          <div id="file-tree" class="file-tree"></div>
+        </div>
+
+        <div class="side-pane" id="side-repos">
+          <div class="side-header">REPOSITORIES</div>
+          <div class="accounts-panel">
+            <div class="settings-section-title">Active Workspace / Repo</div>
+            <label class="field">Switch Project Repo
+              <select id="repo-select"></select>
+            </label>
+
+            <div class="settings-divider"></div>
+            <div class="settings-section-title">Clone / Import GitHub Repo</div>
+            <label class="field">Repository URL or Owner/Repo
+              <input id="repo-import-input" type="text" placeholder="e.g. id-software/DOOM or github url" />
+            </label>
+            <button id="btn-repo-import" class="btn btn-ghost" style="width:100%; justify-content:center;">Clone & Open in Editor</button>
+
+            <div class="settings-divider"></div>
+            <div class="settings-section-title">Official Starter Repos</div>
+            <div id="repo-catalog-list" class="repo-catalog-list"></div>
+          </div>
+        </div>
+
+        <div class="side-pane" id="side-accounts">
+          <div class="side-header">SETTINGS</div>
+          <div class="accounts-panel">
+            <div class="settings-section-title">Compiler & Runtime</div>
+            <label class="field">Compiler Mode
+              <select id="mode-select">
+                <option value="smart" selected>Normal</option>
+                <option value="creative">Easy</option>
+                <option value="literal">Strict</option>
+                <option value="hard">Hard Mode</option>
+              </select>
+            </label>
+
+            <label class="field">AI Engine Provider
+              <select id="provider-type">
+                <option value="cli:codex" selected>ChatGPT (Codex)</option>
+                <option value="grok">Grok (xAI)</option>
+                <option value="cli:gemini">Gemini CLI</option>
+                <option value="gemini-api">Gemini API Key</option>
+                <option value="openai-compatible">OpenAI API Key</option>
+                <option value="cli:claude">Claude CLI</option>
+                <option value="ollama">Local Ollama</option>
+              </select>
+            </label>
+
+            <select id="provider-model" style="display:none;">
+              <option value="auto" selected>Auto (Medium Effort)</option>
+            </select>
+
+            <label class="field" id="field-endpoint" style="display:none;">Endpoint URL
+              <input id="provider-endpoint" type="text" value="http://localhost:11434" />
+            </label>
+            <label class="field" id="field-token" style="display:none;">API Key
+              <input id="provider-token" type="password" placeholder="Paste API key" />
+            </label>
+
+            <div class="btn-row" style="margin-top:2px;">
+              <button id="btn-cli-login" class="btn btn-ghost" style="width:100%; justify-content:center;">Sign In</button>
+            </div>
+            <div id="provider-status" class="provider-status"></div>
+
+            <div class="settings-divider"></div>
+            <div class="settings-section-title">Editor Preferences</div>
+            <label class="field">Font Size (px)
+              <select id="setting-font-size">
+                <option value="12">12 px</option>
+                <option value="13">13 px</option>
+                <option value="14" selected>14 px (Default)</option>
+                <option value="16">16 px</option>
+                <option value="18">18 px</option>
+              </select>
+            </label>
+            <label class="field">Tab Indent Size
+              <select id="setting-tab-size">
+                <option value="2">2 Spaces</option>
+                <option value="4" selected>4 Spaces (Python Standard)</option>
+              </select>
+            </label>
+            <label class="setting-toggle">
+              <span>Line Numbers</span>
+              <input type="checkbox" id="setting-line-numbers" checked />
+            </label>
+            <label class="setting-toggle">
+              <span>Word Wrap</span>
+              <input type="checkbox" id="setting-word-wrap" />
+            </label>
+            <label class="setting-toggle">
+              <span>Code Minimap</span>
+              <input type="checkbox" id="setting-minimap" />
+            </label>
+            <label class="setting-toggle">
+              <span>Auto-Format on Enter</span>
+              <input type="checkbox" id="setting-auto-format" checked />
+            </label>
+
+            <div class="settings-divider"></div>
+            <div class="settings-section-title">Syntax & Build Rules</div>
+            <label class="setting-toggle">
+              <span>Require Code Syntax (`a = b`)</span>
+              <input type="checkbox" id="setting-strict-syntax" checked />
+            </label>
+            <label class="setting-toggle">
+              <span>Auto-Save Files</span>
+              <input type="checkbox" id="setting-auto-save" checked />
+            </label>
+            <label class=" field">Target Frame Rate
+              <select id="setting-fps-limit">
+                <option value="60" selected>60 FPS (VSync)</option>
+                <option value="120">120 FPS</option>
+                <option value="unlimited">Unlimited</option>
+              </select>
+            </label>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Center: Editor + Bottom Panel + Right Preview -->
+      <div id="workbench">
+        <div id="top-split">
+          <!-- Editor Area -->
+          <section id="editor-pane">
+            <div id="editor-tabs" class="editor-tabs"></div>
+            <div id="editor-container">
+              <div id="monaco-host"></div>
+              <textarea id="fallback-editor" spellcheck="false" style="display:none;"></textarea>
+            </div>
+          </section>
+
+          <!-- Live App Preview -->
+          <section id="preview-pane">
+            <div class="preview-header">
+              <span>FINISHED PRODUCT • <span id="preview-badge">READY</span></span>
+              <div class="preview-actions">
+                <button id="btn-refresh-preview" class="btn-mini" title="Reload Preview">↻</button>
+                <a id="btn-open-external" class="btn-mini" target="_blank" title="Open in Browser">↗</a>
+              </div>
+            </div>
+            <div id="preview-empty" class="preview-empty">
+              <div>Click <strong>▶ Run</strong> to build and display your finished product here.</div>
+            </div>
+            <iframe id="preview-frame" style="display:none;"></iframe>
+            <pre id="preview-console" class="terminal-output" style="display:none; padding:16px; height:100%; overflow:auto; background:#0b0f19;"></pre>
+          </section>
+        </div>
+
+        <!-- Compact Build Status Bar -->
+        <section id="bottom-panel">
+          <div class="panel-body">
+            <div class="panel-view active" id="panel-pipeline">
+              <div id="pipeline-list" class="pipeline-list">
+                <div class="muted">Idle</div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js?v=11"></script>
+</body>
+</html>
