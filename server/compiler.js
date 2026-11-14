@@ -247,6 +247,68 @@ function resolveCodexBinary() {
   return 'codex';
 }
 
+const DEFAULT_GROK_MODEL = 'grok-4.7';
+
+function grokHomeDir() {
+  return process.env.GROK_HOME || path.join(os.homedir(), '.grok');
+}
+
+function resolveGrokBinary() {
+  const name = process.platform === 'win32' ? 'grok.exe' : 'grok';
+  const homeBin = path.join(grokHomeDir(), 'bin', name);
+  if (fs.existsSync(homeBin)) return homeBin;
+  return name;
+}
+
+function grokCliInstalled() {
+  const bin = resolveGrokBinary();
+  if (path.isAbsolute(bin)) return fs.existsSync(bin);
+  const dirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  return dirs.some((dir) => fs.existsSync(path.join(dir, bin)));
+}
+
+function grokCliEnv() {
+  const env = { ...process.env };
+  delete env.XAI_API_KEY;
+  delete env.GROK_API_KEY;
+  return env;
+}
+
+function grokModel(provider) {
+  const model = (provider?.model || '').trim();
+  if (model.startsWith('grok-')) return model;
+  return DEFAULT_GROK_MODEL;
+}
+
+function getGrokAuthStatus() {
+  const installed = grokCliInstalled();
+  const authPath = path.join(grokHomeDir(), 'auth.json');
+  if (!fs.existsSync(authPath)) {
+    return { installed, loggedIn: false, email: '', name: '', updatedAt: 0 };
+  }
+  let updatedAt = 0;
+  try {
+    updatedAt = fs.statSync(authPath).mtimeMs || 0;
+  } catch {}
+  try {
+    const data = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+    const entry = Object.values(data).find((value) => (
+      value && typeof value === 'object' && (value.refresh_token || value.key || value.access_token)
+    ));
+    if (!entry) return { installed, loggedIn: false, email: '', name: '', updatedAt };
+    const name = [entry.first_name, entry.last_name].filter((part) => typeof part === 'string' && part).join(' ');
+    return {
+      installed,
+      loggedIn: true,
+      email: typeof entry.email === 'string' ? entry.email : '',
+      name,
+      updatedAt
+    };
+  } catch {
+    return { installed, loggedIn: false, email: '', name: '', updatedAt };
+  }
+}
+
 function isGeminiApiProvider(provider) {
   if (!provider) return false;
   if (provider.type === 'gemini-api') return true;
@@ -291,23 +353,14 @@ async function testAIProvider(provider) {
   }
 
   if (provider.type === 'grok') {
-    const token = (provider.token || '').trim();
-    if (!token) throw new Error('Paste your xAI Grok API key (starts with xai-...) in Settings -> API Key.');
-    const model = provider.model && provider.model !== 'auto' ? provider.model : 'grok-3-mini';
-    const res = await fetch('https://api.x.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({
-        model,
-        max_tokens: 8,
-        messages: [{ role: 'user', content: 'Say ok' }]
-      })
-    });
-    if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      throw new Error(`Grok API HTTP ${res.status}: ${errText.slice(0, 140)}`);
+    const status = getGrokAuthStatus();
+    if (!status.installed) {
+      throw new Error('Grok CLI is not installed. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash');
     }
-    return { ok: true, message: `Grok (xAI) connected • Active model: ${model}` };
+    if (!status.loggedIn) {
+      throw new Error('Grok is not signed in. Click Sign in with Grok in Settings.');
+    }
+    return { ok: true, message: `Grok signed in with OAuth • ${grokModel(provider)}` };
   }
 
   if (provider.type === 'openai-compatible') {
@@ -426,11 +479,11 @@ function cancelActiveBuild() {
   }
 }
 
-function runProcess({ bin, args, prompt, cwd, emit, useShell = false, timeoutMs = 300000 }) {
+function runProcess({ bin, args, prompt, cwd, emit, useShell = false, timeoutMs = 300000, env }) {
   cancelActiveBuild();
   return new Promise((resolve, reject) => {
     emit('terminal', { stream: 'system', text: `$ ${path.basename(bin)} ${args.join(' ')}\r\n` });
-    const proc = spawn(bin, args, { cwd, shell: useShell, windowsHide: true });
+    const proc = spawn(bin, args, { cwd, shell: useShell, windowsHide: true, env: env || process.env });
     activeBuildProc = proc;
     let stdout = '';
     let stderr = '';
@@ -881,26 +934,48 @@ STRICT RULES (FOLLOW EXACTLY):
   }
 
   if (provider.type === 'grok') {
-    const token = (provider.token || '').trim();
-    if (!token) throw new Error('xAI Grok API Key is required. Paste your key (xai-...) in Settings.');
-    const model = provider.model && provider.model !== 'auto' ? provider.model : 'grok-3-mini';
-    const res = await fetch('https://api.x.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'user', content: sharedInstructions }]
-      })
-    });
-    if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      throw new Error(`Grok API returned HTTP ${res.status}: ${errText.slice(0, 160)}`);
+    const status = getGrokAuthStatus();
+    if (!status.installed) {
+      throw new Error('Grok CLI is not installed. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash');
     }
-    const data = await res.json();
-    const files = parseGeneratedOutput(data.choices?.[0]?.message?.content || '', target);
-    if (!files) throw new Error('Grok did not return valid file blocks.');
-    if (files['index.html']) files[buildHtmlName] = files['index.html'];
-    return writeFilesToWorkspace(projDir, files);
+    if (!status.loggedIn) {
+      throw new Error('Grok is not signed in. Click Sign in with Grok in Settings.');
+    }
+    const model = grokModel(provider);
+    const promptFile = path.join(os.tmpdir(), `cod-grok-${Date.now()}.txt`);
+    fs.writeFileSync(promptFile, sharedInstructions, 'utf8');
+    try {
+      let result;
+      try {
+        result = await runProcess({
+          bin: resolveGrokBinary(),
+          args: [
+            '--no-auto-update',
+            '--no-alt-screen',
+            '--verbatim',
+            '--disable-web-search',
+            '--max-turns', '1',
+            '-m', model,
+            '--output-format', 'plain',
+            '--prompt-file', promptFile
+          ],
+          cwd: projDir,
+          emit,
+          env: grokCliEnv()
+        });
+      } catch (err) {
+        if (err && err.code === 'ENOENT') {
+          throw new Error('Grok CLI is not installed. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash');
+        }
+        throw err;
+      }
+      const files = parseGeneratedOutput(result.stdout, target);
+      if (!files) throw new Error('Grok did not return valid file blocks.');
+      if (files['index.html']) files[buildHtmlName] = files['index.html'];
+      return writeFilesToWorkspace(projDir, files);
+    } finally {
+      try { fs.unlinkSync(promptFile); } catch {}
+    }
   }
 
   if (provider.type === 'openai-compatible') {
@@ -954,6 +1029,9 @@ module.exports = {
   detectTarget,
   getCodexCatalog,
   resolveCodexBinary,
+  resolveGrokBinary,
+  grokCliEnv,
+  getGrokAuthStatus,
   getBuildHtmlName,
   tryDirectCodeExecution,
   compileWithAI,

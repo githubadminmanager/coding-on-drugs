@@ -10,6 +10,9 @@ const {
   detectTarget,
   getCodexCatalog,
   resolveCodexBinary,
+  resolveGrokBinary,
+  grokCliEnv,
+  getGrokAuthStatus,
   getBuildHtmlName,
   tryDirectCodeExecution,
   compileWithAI,
@@ -415,7 +418,8 @@ app.get('/api/provider', (req, res) => {
     endpoint: aiProvider.endpoint,
     model: aiProvider.model,
     hasToken: Boolean(aiProvider.token),
-    codexCatalog: getCodexCatalog()
+    codexCatalog: getCodexCatalog(),
+    grokAuth: getGrokAuthStatus()
   });
 });
 
@@ -446,9 +450,75 @@ let activeLoginProc = null;
 
 app.post('/api/cli/login', (req, res) => {
   const { execFile, spawn } = require('child_process');
-  const cli = req.body?.cli === 'gemini' ? 'gemini' : 'codex';
-  const bin = cli === 'codex' ? resolveCodexBinary() : 'gemini';
-  const args = cli === 'codex' ? ['login'] : [];
+  const requested = req.body?.cli;
+  const cli = requested === 'gemini' ? 'gemini' : requested === 'grok' ? 'grok' : 'codex';
+  const bin = cli === 'codex' ? resolveCodexBinary() : cli === 'grok' ? resolveGrokBinary() : 'gemini';
+  const args = cli === 'codex' ? ['login'] : cli === 'grok' ? ['login', '--oauth'] : [];
+
+  if (cli === 'grok') {
+    const status = getGrokAuthStatus();
+    if (!status.installed) {
+      return res.status(400).json({
+        ok: false,
+        message: 'Grok CLI is not installed. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash'
+      });
+    }
+    if (activeLoginProc) {
+      try { activeLoginProc.kill(); } catch {}
+      activeLoginProc = null;
+    }
+
+    let responded = false;
+    let combined = '';
+    const child = spawn(bin, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      env: grokCliEnv()
+    });
+    activeLoginProc = child;
+
+    const handleChunk = (chunk) => {
+      combined += chunk.toString().replace(/\x1B\[[0-9;]*[A-Za-z]/g, '');
+      const urlMatch = combined.match(/https:\/\/(?:auth\.x\.ai|accounts\.x\.ai|accounts\.spacex\.ai|auth\.grok\.com)\/\S+/);
+      if (urlMatch && !responded) {
+        responded = true;
+        res.json({
+          ok: true,
+          authUrl: urlMatch[0].trim(),
+          message: 'Grok sign-in link ready. Open it in your browser to finish OAuth:'
+        });
+      }
+    };
+
+    child.stdout.on('data', handleChunk);
+    child.stderr.on('data', handleChunk);
+    child.on('error', (err) => {
+      if (!responded) {
+        responded = true;
+        res.status(400).json({
+          ok: false,
+          message: err.code === 'ENOENT'
+            ? 'Grok CLI is not installed. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash'
+            : `Grok CLI could not start: ${err.message}`
+        });
+      }
+    });
+    child.on('close', () => {
+      if (activeLoginProc === child) activeLoginProc = null;
+      const auth = getGrokAuthStatus();
+      if (auth.loggedIn) emit('auth_updated', { cli: 'grok', grokAuth: auth });
+    });
+    setTimeout(() => {
+      if (!responded) {
+        responded = true;
+        res.json({
+          ok: true,
+          message: 'Grok sign-in started. Finish it in the browser window.'
+        });
+      }
+    }, 3000);
+    return;
+  }
 
   if (cli === 'codex') {
     if (activeLoginProc) {
