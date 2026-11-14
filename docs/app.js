@@ -2001,6 +2001,44 @@ const MODEL_OPTIONS = {
   ]
 };
 
+function providerSelectValue(info) {
+  if (!info) return '';
+  if (info.selectValue) return info.selectValue;
+  if (info.type === 'grok') return 'grok';
+  if (info.type === 'cli') return `cli:${info.cli || 'codex'}`;
+  return info.type || '';
+}
+
+function readSavedProviderChoice() {
+  try {
+    return JSON.parse(localStorage.getItem('cod_provider_v1') || 'null');
+  } catch {
+    return null;
+  }
+}
+
+function rememberProviderChoice(selectValue, extra = {}) {
+  try {
+    localStorage.setItem('cod_provider_v1', JSON.stringify({
+      selectValue,
+      endpoint: extra.endpoint || '',
+      model: extra.model || ''
+    }));
+  } catch {}
+}
+
+function restoreProviderForm(choice) {
+  const select = el('provider-type');
+  const value = providerSelectValue(choice);
+  if (!select || !value) return false;
+  if (!Array.from(select.options).some((opt) => opt.value === value)) return false;
+  select.value = value;
+  if ((value === 'ollama' || value === 'openai-compatible') && choice.endpoint && el('provider-endpoint')) {
+    el('provider-endpoint').value = choice.endpoint;
+  }
+  return true;
+}
+
 function parseProviderPayload() {
   const rawType = el('provider-type').value;
   const label = el('provider-type').options[el('provider-type').selectedIndex]?.text || rawType;
@@ -2019,6 +2057,10 @@ function parseProviderPayload() {
 
 async function applyAndSaveProvider() {
   const payload = parseProviderPayload();
+  rememberProviderChoice(el('provider-type').value, {
+    endpoint: payload.endpoint,
+    model: payload.model
+  });
   await api('/api/provider', { method: 'POST', body: JSON.stringify(payload) });
   if (el('status-provider')) el('status-provider').textContent = `Engine: ${payload.label}`;
   if (payload.type === 'grok') {
@@ -2168,8 +2210,9 @@ if (el('btn-test-provider')) {
 }
 
 async function initProviderCatalog() {
+  let info = null;
   try {
-    const info = await api('/api/provider');
+    info = await api('/api/provider');
     if (info.codexCatalog) {
       codexLoggedIn = Boolean(info.codexCatalog.loggedIn);
     }
@@ -2177,10 +2220,9 @@ async function initProviderCatalog() {
       grokLoggedIn = Boolean(info.grokAuth.loggedIn);
       grokAuthUpdatedAt = info.grokAuth.updatedAt || 0;
     }
-    await syncProviderUI();
-  } catch {
-    await syncProviderUI();
-  }
+  } catch {}
+  if (!restoreProviderForm(readSavedProviderChoice())) restoreProviderForm(info);
+  await syncProviderUI();
 }
 
 function applyEditorSettings() {
