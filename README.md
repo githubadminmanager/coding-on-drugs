@@ -156,4 +156,5 @@ Then open **localhost** in your browser.
 
 - **Custom API Endpoint** (`OpenAI` / `OpenRouter` / any OpenAI-compatible `/v1` endpoint)
 - **Local Ollama** (100% offline local models like `llama3.2`, `qwen2.5-coder`, `deepseek-coder-v2`)
+- **Grok** (OAuth through the Grok CLI. Click **Sign in with Grok** in Settings, which runs `grok login --oauth`. The signed-in account is used. No API key.)
 - **Local CLI Accounts** (`Codex CLI`, `Gemini CLI`, `Claude CLI` when running on your local machine)

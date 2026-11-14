@@ -752,19 +752,7 @@ async function callBrowserAI(provider, promptText) {
   }
 
   if (provider.type === 'grok') {
-    if (!tok) throw new Error('Paste your xAI Grok API key (starts with xai-...) in Settings -> API Key.');
-    const model = provider.model && provider.model !== 'auto' ? provider.model : 'grok-3-mini';
-    const res = await fetch('https://api.x.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
-      body: JSON.stringify({ model, messages: [{ role: 'user', content: promptText }] })
-    });
-    if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      throw new Error(`Grok API HTTP ${res.status}: ${errText.slice(0, 140)}`);
-    }
-    const data = await res.json();
-    return data.choices?.[0]?.message?.content || '';
+    throw new Error('Grok uses browser sign-in. Start the local server with npm start, then click Sign in with Grok.');
   }
 
   if (provider.type === 'openai-compatible') {
@@ -1899,6 +1887,8 @@ if (el('btn-open-external')) {
 
 // AI Provider / Account & Model Connection
 let codexLoggedIn = false;
+let grokLoggedIn = false;
+let grokAuthUpdatedAt = 0;
 let loginPollTimer = null;
 
 const customSelectRegistry = new Map();
@@ -2021,6 +2011,9 @@ function parseProviderPayload() {
     const cliName = rawType.split(':')[1];
     return { type: 'cli', cli: cliName, model: 'auto', label, endpoint: 'local-cli', token: '' };
   }
+  if (rawType === 'grok') {
+    return { type: 'grok', model: 'grok-4.7', label, endpoint: 'grok-oauth', token: '' };
+  }
   return { type: rawType, model: 'auto', label, endpoint, token };
 }
 
@@ -2028,7 +2021,12 @@ async function applyAndSaveProvider() {
   const payload = parseProviderPayload();
   await api('/api/provider', { method: 'POST', body: JSON.stringify(payload) });
   if (el('status-provider')) el('status-provider').textContent = `Engine: ${payload.label}`;
-  if (payload.type === 'cli' && payload.cli === 'codex' && !codexLoggedIn) {
+  if (payload.type === 'grok') {
+    el('provider-status').style.color = grokLoggedIn ? '#59a869' : '#a3a3a3';
+    el('provider-status').textContent = grokLoggedIn
+      ? 'Grok signed in • grok-4.7'
+      : 'Not signed in — click Sign in with Grok.';
+  } else if (payload.type === 'cli' && payload.cli === 'codex' && !codexLoggedIn) {
     el('provider-status').style.color = '#a3a3a3';
     el('provider-status').textContent = 'Not signed in — click Connect ChatGPT above.';
   } else {
@@ -2045,21 +2043,23 @@ async function syncProviderUI() {
     el('provider-endpoint').value = 'https://api.openai.com/v1';
   }
   el('field-endpoint').style.display = t === 'ollama' || t === 'openai-compatible' ? 'flex' : 'none';
-  el('field-token').style.display = t === 'gemini-api' || t === 'openai-compatible' || t === 'grok' ? 'flex' : 'none';
-  el('provider-token').placeholder =
-    t === 'gemini-api'
-      ? 'Paste Gemini API key (AIza...)'
-      : t === 'grok'
-        ? 'Paste xAI Grok API key (xai-...)'
-        : 'Paste API key (sk-...)';
+  el('field-token').style.display = t === 'gemini-api' || t === 'openai-compatible' ? 'flex' : 'none';
+  el('provider-token').placeholder = t === 'gemini-api' ? 'Paste Gemini API key (AIza...)' : 'Paste API key (sk-...)';
   if (el('btn-cli-login')) {
-    el('btn-cli-login').style.display = t.startsWith('cli:') ? 'inline-flex' : 'none';
-    el('btn-cli-login').textContent = t === 'cli:codex' ? (codexLoggedIn ? 'Switch ChatGPT Account' : 'Connect ChatGPT') : 'Sign In';
+    el('btn-cli-login').style.display = t.startsWith('cli:') || t === 'grok' ? 'inline-flex' : 'none';
+    el('btn-cli-login').textContent = t === 'grok'
+      ? (grokLoggedIn ? 'Switch Grok account' : 'Sign in with Grok')
+      : t === 'cli:codex'
+        ? (codexLoggedIn ? 'Switch ChatGPT Account' : 'Connect ChatGPT')
+        : 'Sign In';
   }
 
   upgradeCustomSelect(el('provider-type'), (val) => {
     if (val === 'cli:codex' && !codexLoggedIn) {
       triggerCliLogin('codex');
+    }
+    if (val === 'grok' && !grokLoggedIn) {
+      triggerCliLogin('grok');
     }
   });
   upgradeCustomSelect(el('mode-select'));
@@ -2073,8 +2073,9 @@ el('provider-token').onchange = () => applyAndSaveProvider();
 el('provider-endpoint').onchange = () => applyAndSaveProvider();
 
 async function triggerCliLogin(cli = 'codex') {
+  const grokStamp = grokAuthUpdatedAt;
   el('provider-status').style.color = '#a3a3a3';
-  el('provider-status').textContent = `Generating ${cli === 'codex' ? 'ChatGPT' : cli} sign-in link...`;
+  el('provider-status').textContent = `Generating ${cli === 'codex' ? 'ChatGPT' : cli === 'grok' ? 'Grok' : cli} sign-in link...`;
   const res = await api('/api/cli/login', {
     method: 'POST',
     body: JSON.stringify({ cli })
@@ -2118,7 +2119,15 @@ async function triggerCliLogin(cli = 'codex') {
     }
     try {
       const info = await api('/api/provider');
-      if (info.codexCatalog && info.codexCatalog.loggedIn) {
+      if (cli === 'grok' && info.grokAuth && info.grokAuth.loggedIn && info.grokAuth.updatedAt !== grokStamp) {
+        clearInterval(loginPollTimer);
+        loginPollTimer = null;
+        grokLoggedIn = true;
+        grokAuthUpdatedAt = info.grokAuth.updatedAt || 0;
+        await initProviderCatalog();
+        el('provider-status').style.color = '#59a869';
+        el('provider-status').textContent = 'Grok signed in ✓';
+      } else if (cli !== 'grok' && info.codexCatalog && info.codexCatalog.loggedIn) {
         clearInterval(loginPollTimer);
         loginPollTimer = null;
         codexLoggedIn = true;
@@ -2132,6 +2141,11 @@ async function triggerCliLogin(cli = 'codex') {
 
 if (el('btn-cli-login')) {
   el('btn-cli-login').onclick = async () => {
+    const raw = el('provider-type').value;
+    if (raw === 'grok') {
+      await triggerCliLogin('grok');
+      return;
+    }
     const payload = parseProviderPayload();
     const cli = payload.cli || 'codex';
     await triggerCliLogin(cli);
@@ -2158,6 +2172,10 @@ async function initProviderCatalog() {
     const info = await api('/api/provider');
     if (info.codexCatalog) {
       codexLoggedIn = Boolean(info.codexCatalog.loggedIn);
+    }
+    if (info.grokAuth) {
+      grokLoggedIn = Boolean(info.grokAuth.loggedIn);
+      grokAuthUpdatedAt = info.grokAuth.updatedAt || 0;
     }
     await syncProviderUI();
   } catch {
