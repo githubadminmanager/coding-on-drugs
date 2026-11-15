@@ -325,7 +325,7 @@ function firstImportedFile(projDir) {
 
 app.post('/api/repos/import', async (req, res) => {
   const rawInput = String(req.body?.repo || '').trim();
-  if (!rawInput) return res.status(400).json({ ok: false, error: 'Enter a GitHub repository URL or user/repo name.' });
+  if (!rawInput) return res.json({ ok: false, error: 'Enter a GitHub repository URL or user/repo name.' });
 
   if (STARTER_REPOS[rawInput]) {
     ensureStarterRepos();
@@ -334,19 +334,19 @@ app.post('/api/repos/import', async (req, res) => {
 
   const ghMatch = rawInput.match(/^(?:https?:\/\/)?(?:www\.)?github\.com\/([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+?)(?:\.git)?\/?$|^([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+?)(?:\.git)?$/);
   if (!ghMatch) {
-    return res.status(400).json({ ok: false, error: 'Enter a GitHub repository as owner/repo or a GitHub URL.' });
+    return res.json({ ok: false, error: 'Enter a GitHub repository as owner/repo or a GitHub URL.' });
   }
   const owner = ghMatch[1] || ghMatch[3];
   const repo = (ghMatch[2] || ghMatch[4] || '').replace(/\.git$/, '');
   if (!owner || !repo || owner === '.' || repo === '.' || owner === '..' || repo === '..') {
-    return res.status(400).json({ ok: false, error: 'Enter a GitHub repository as owner/repo or a GitHub URL.' });
+    return res.json({ ok: false, error: 'Enter a GitHub repository as owner/repo or a GitHub URL.' });
   }
   const safeName = `${owner}-${repo}`.toLowerCase().replace(/[^a-z0-9._-]/g, '-').slice(0, 48);
   const projDir = path.join(WORKSPACES_DIR, safeName);
   try {
     await replaceProjectWithClone(owner, repo, projDir);
   } catch (err) {
-    return res.status(502).json({
+    return res.json({
       ok: false,
       error: err && err.code === 'ENOENT'
         ? 'git is not installed, so the repository could not be cloned.'
