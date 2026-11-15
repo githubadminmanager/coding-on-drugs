@@ -51,15 +51,42 @@ function looksLikeGibberishToken(word) {
   return false;
 }
 
+function lineIndentWidth(raw) {
+  const match = /^([ \t]*)/.exec(raw || '');
+  return match[1].replace(/\t/g, '    ').length;
+}
+
+function statementOpensBlock(trimmed) {
+  if (/^(if|elif|else|when|whenever|while|for|every|repeat|def|function|class|on|try|except|finally)\b/i.test(trimmed)) {
+    return true;
+  }
+  return /[:{]\s*$/.test(trimmed);
+}
+
 function validateCodeSyntax(source, mode = 'smart') {
   const errors = [];
   const lines = (source || '').split(/\r?\n/);
   const codeLines = [];
+  let prevIndent = 0;
+  let prevOpensBlock = false;
+  let hasPrevCode = false;
 
   lines.forEach((raw, idx) => {
     const lineNum = idx + 1;
     const t = raw.trim();
     if (!t || t.startsWith('#') || t.startsWith('//')) return;
+    const indent = lineIndentWidth(raw);
+    if (hasPrevCode && indent > prevIndent && !prevOpensBlock) {
+      errors.push({
+        severity: 'error',
+        line: lineNum,
+        code: 'ORPHAN-INDENT',
+        message: `SyntaxError on line ${lineNum}: Indented statement is not inside a block. Attach it to an if/when/for/def line, or remove the indent.`
+      });
+    }
+    prevIndent = indent;
+    prevOpensBlock = statementOpensBlock(t);
+    hasPrevCode = true;
     codeLines.push({ lineNum, t });
 
     const eqMatch = t.match(/^([a-zA-Z_][\w\s.]*?)\s*(=|:|->|\+=|-=|\*=|\/=)\s*(.+)$/);
@@ -179,11 +206,11 @@ function getCodexCatalog() {
   const authPath = path.join(codexHome, 'auth.json');
   const configPath = path.join(codexHome, 'config.toml');
 
-  let defaultModel = 'gpt-6-sol';
+  let defaultModel = '';
   if (fs.existsSync(configPath)) {
     const cfg = fs.readFileSync(configPath, 'utf-8');
     const m = cfg.match(/^\s*model\s*=\s*"([^"]+)"/m);
-    if (m && m[1] !== 'gpt-6.1-sol') defaultModel = m[1];
+    if (m) defaultModel = m[1];
   }
 
   let models = [];
@@ -200,14 +227,8 @@ function getCodexCatalog() {
     } catch {}
   }
 
-  if (models.length === 0) {
-    models = [
-      { value: 'gpt-6.1-sol', label: 'GPT-6.1-Sol — Latest workhorse model', shortLabel: 'GPT-6.1-Sol' },
-      { value: 'gpt-6-astra', label: 'GPT-6-Astra — Frontier intelligence', shortLabel: 'GPT-6-Astra' },
-      { value: 'gpt-6.1-terra', label: 'GPT-6.1 Terra', shortLabel: 'GPT-6.1 Terra' },
-      { value: 'gpt-reserve', label: 'GPT-Reserve — Fast agentic coding', shortLabel: 'GPT-Reserve' },
-      { value: 'gpt-6-luna', label: 'GPT-6-Luna — Fast and affordable', shortLabel: 'GPT-6-Luna' }
-    ];
+  if (models.length === 0 && defaultModel) {
+    models = [{ value: defaultModel, label: defaultModel, shortLabel: defaultModel }];
   }
 
   let loggedIn = fs.existsSync(authPath) && fs.statSync(authPath).size > 10;
@@ -280,6 +301,67 @@ function grokModel(provider) {
   return DEFAULT_GROK_MODEL;
 }
 
+function cliBinaryInstalled(bin) {
+  if (!bin) return false;
+  if (path.isAbsolute(bin)) return fs.existsSync(bin);
+  const dirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  return dirs.some((dir) => fs.existsSync(path.join(dir, bin)));
+}
+
+function resolveCliBinary(cliName) {
+  const name = (cliName || '').trim();
+  if (name === 'codex') return resolveCodexBinary();
+  if (name === 'grok') return resolveGrokBinary();
+  const home = os.homedir();
+  const candidates = [
+    path.join(home, '.local', 'bin', name),
+    path.join(home, '.grok', 'bin', name),
+    `/opt/homebrew/bin/${name}`,
+    `/usr/local/bin/${name}`,
+    path.join(home, '.npm-global', 'bin', name)
+  ];
+  const fnmDir = path.join(home, '.local', 'share', 'fnm', 'node-versions');
+  if (fs.existsSync(fnmDir)) {
+    try {
+      for (const ver of fs.readdirSync(fnmDir)) {
+        candidates.push(path.join(fnmDir, ver, 'installation', 'bin', name));
+      }
+    } catch {}
+  }
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return name;
+}
+
+function providerKey(provider = {}) {
+  if (provider.type === 'cli') return `cli:${(provider.cli || 'codex').trim()}`;
+  if (isGeminiApiProvider(provider)) return 'gemini-api';
+  return (provider.type || '').trim();
+}
+
+const FALLBACK_MODELS = {
+  'cli:grok': DEFAULT_GROK_MODEL,
+  grok: DEFAULT_GROK_MODEL,
+  'cli:gemini': 'gemini-3.8-flash',
+  'gemini-api': 'gemini-3.8-flash',
+  'cli:claude': 'sonnet',
+  'openai-compatible': 'gpt-4o-mini'
+};
+
+function resolveModelForProvider(provider = {}) {
+  const key = providerKey(provider);
+  const fallback = FALLBACK_MODELS[key] || '';
+  const model = (provider.model || '').trim();
+  if (!model || model === 'auto') return fallback;
+  if ((key === 'cli:grok' || key === 'grok') && !model.startsWith('grok-')) return fallback || DEFAULT_GROK_MODEL;
+  if ((key === 'cli:gemini' || key === 'gemini-api') && !model.startsWith('gemini')) return fallback;
+  if (key === 'cli:claude' && !/^(sonnet|opus|haiku|fable)$/.test(model) && !model.startsWith('claude')) return fallback;
+  if (key === 'cli:codex' && /^(grok|gemini|claude)/.test(model)) return '';
+  if (key === 'openai-compatible' && /^(grok|gemini|claude)/.test(model)) return fallback;
+  return model;
+}
+
 function getGrokAuthStatus() {
   const installed = grokCliInstalled();
   const authPath = path.join(grokHomeDir(), 'auth.json');
@@ -325,17 +407,26 @@ async function testAIProvider(provider) {
 
   if (provider.type === 'ollama') {
     const endpoint = (provider.endpoint || 'http://localhost:11434').replace(/\/$/, '');
-    const res = await fetch(`${endpoint}/api/tags`);
-    if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`);
-    const data = await res.json();
-    const models = (data.models || []).map((m) => m.name);
-    return { ok: true, message: `Ollama connected (${models.length} model(s): ${models.slice(0, 3).join(', ') || 'none'})` };
+    try {
+      const res = await fetch(`${endpoint}/api/tags`);
+      if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`);
+      const data = await res.json();
+      const models = (data.models || []).map((m) => m.name).filter(Boolean);
+      const requested = (provider.model || '').trim();
+      if (requested && requested !== 'auto' && !models.some((name) => name === requested || name.startsWith(`${requested}:`))) {
+        throw new Error(`Ollama model "${requested}" is not installed. Installed: ${models.slice(0, 8).join(', ') || 'none'}`);
+      }
+      return { ok: true, message: `Ollama connected (${models.length} model(s): ${models.slice(0, 3).join(', ') || 'none'})` };
+    } catch (err) {
+      if (err && /^Ollama\b/.test(String(err.message || ''))) throw err;
+      throw new Error(`Ollama is not running at ${endpoint}. Start it with: ollama serve`);
+    }
   }
 
   if (isGeminiApiProvider(provider)) {
     const token = (provider.token || '').trim();
     if (!token) throw new Error('Paste your Google Gemini API key (starts with AIza...) in the API Key field.');
-    const model = provider.model && provider.model.startsWith('gemini') ? provider.model : 'gemini-2.5-flash';
+    const model = resolveModelForProvider(provider);
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(token)}`;
     const res = await fetch(url, {
       method: 'POST',
@@ -353,6 +444,23 @@ async function testAIProvider(provider) {
   }
 
   if (provider.type === 'grok') {
+    const token = (provider.token || '').trim();
+    const model = grokModel(provider);
+    if (token) {
+      const res = await fetch('https://api.x.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: 'Say ok' }]
+        })
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(`Grok API HTTP ${res.status}: ${errText.slice(0, 140)}`);
+      }
+      return { ok: true, message: `Grok API connected • ${model}` };
+    }
     const status = getGrokAuthStatus();
     if (!status.installed) {
       throw new Error('Grok CLI is not installed. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash');
@@ -360,7 +468,7 @@ async function testAIProvider(provider) {
     if (!status.loggedIn) {
       throw new Error('Grok is not signed in. Click Sign in with Grok in Settings.');
     }
-    return { ok: true, message: `Grok signed in with OAuth • ${grokModel(provider)}` };
+    return { ok: true, message: `Grok signed in with OAuth • ${model}` };
   }
 
   if (provider.type === 'openai-compatible') {
@@ -371,13 +479,12 @@ async function testAIProvider(provider) {
     }
     const headers = { 'Content-Type': 'application/json' };
     if (token) headers.Authorization = `Bearer ${token}`;
-    const model = provider.model && !provider.model.includes('-sol') && !provider.model.includes('-luna') ? provider.model : 'gpt-4o-mini';
+    const model = resolveModelForProvider(provider);
     const res = await fetch(`${endpoint}/chat/completions`, {
       method: 'POST',
       headers,
       body: JSON.stringify({
         model,
-        max_tokens: 8,
         messages: [{ role: 'user', content: 'Say ok' }]
       })
     });
@@ -391,32 +498,46 @@ async function testAIProvider(provider) {
   if (provider.type === 'cli') {
     const cli = (provider.cli || 'codex').trim();
     if (cli === 'codex') {
+      if (!cliBinaryInstalled(resolveCodexBinary())) {
+        throw new Error('Codex CLI is not installed.');
+      }
       const cat = getCodexCatalog();
       return {
         ok: cat.loggedIn,
         message: cat.loggedIn
-          ? `ChatGPT Account connected via Codex • Active model: ${provider.model || cat.defaultModel}`
+          ? `ChatGPT Account connected via Codex • Active model: ${resolveModelForProvider(provider) || cat.defaultModel || 'account default'}`
           : 'Codex installed, but not logged in yet. Click "Sign In / Switch Account".'
       };
+    }
+    const activeModel = resolveModelForProvider(provider) || 'account default';
+    if (cli === 'grok') {
+      const status = getGrokAuthStatus();
+      if (!status.installed) {
+        throw new Error('Grok CLI is not installed. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash');
+      }
+      if (!status.loggedIn) {
+        throw new Error('Grok is not signed in. Click Sign in with Grok in Settings.');
+      }
+      return { ok: true, message: `Grok signed in with OAuth • ${activeModel}` };
     }
     if (cli === 'gemini') {
       const hasOAuth = fs.existsSync(path.join(os.homedir(), '.gemini', 'oauth_creds.json'));
       return new Promise((resolve, reject) => {
-        execFile('gemini', ['--version'], { shell: true, timeout: 6000 }, (err, stdout) => {
+        execFile(resolveCliBinary('gemini'), ['--version'], { timeout: 6000 }, (err, stdout) => {
           if (err) return reject(new Error(`Gemini CLI not found: ${err.message}`));
           resolve({
             ok: true,
             message: hasOAuth
-              ? `Google Account connected via Gemini CLI (v${(stdout || '').trim()}) • Active model: ${provider.model || 'gemini-2.5-flash'}`
+              ? `Google Account connected via Gemini CLI (v${(stdout || '').trim()}) • Active model: ${activeModel}`
               : `Gemini CLI v${(stdout || '').trim()} installed — click "Sign In / Switch Account" if prompted.`
           });
         });
       });
     }
     return new Promise((resolve, reject) => {
-      execFile(cli, ['--version'], { shell: true, timeout: 5000 }, (err, stdout) => {
+      execFile(resolveCliBinary(cli), ['--version'], { timeout: 5000 }, (err, stdout) => {
         if (err) return reject(new Error(`CLI "${cli}" not found: ${err.message}`));
-        resolve({ ok: true, message: `CLI "${cli}" ready (${provider.model}): ${(stdout || 'ok').trim().slice(0, 80)}` });
+        resolve({ ok: true, message: `CLI "${cli}" ready (${activeModel}): ${(stdout || 'ok').trim().slice(0, 80)}` });
       });
     });
   }
@@ -515,6 +636,10 @@ function runProcess({ bin, args, prompt, cwd, emit, useShell = false, timeoutMs 
     proc.on('error', (err) => {
       clearTimeout(timer);
       if (activeBuildProc === proc) activeBuildProc = null;
+      if (err && err.code === 'ENOENT') {
+        reject(new Error(`${path.basename(bin)} is not installed.`));
+        return;
+      }
       reject(err);
     });
 
@@ -813,6 +938,53 @@ function tryDirectCodeExecution(source, projDir, emit, activeFile = 'main.py') {
   });
 }
 
+async function resolveOllamaModel(provider = {}) {
+  const endpoint = (provider.endpoint || 'http://localhost:11434').replace(/\/$/, '');
+  const requested = (provider.model || '').trim();
+  let names = [];
+  try {
+    const res = await fetch(`${endpoint}/api/tags`);
+    if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`);
+    const data = await res.json();
+    names = (data.models || []).map((m) => m.name).filter(Boolean);
+  } catch (err) {
+    if (err && String(err.message || '').startsWith('Ollama HTTP')) throw err;
+    throw new Error(`Ollama is not running at ${endpoint}. Start it with: ollama serve`);
+  }
+  if (!names.length) {
+    throw new Error('Ollama has no models installed. Pull one with: ollama pull qwen2.5-coder');
+  }
+  if (!requested || requested === 'auto') return names[0];
+  const hit = names.find((name) => name === requested || name.startsWith(`${requested}:`));
+  if (!hit) {
+    throw new Error(`Ollama model "${requested}" is not installed. Installed: ${names.slice(0, 8).join(', ')}`);
+  }
+  return hit;
+}
+
+async function compileWithGrokApi({ provider, target, projDir, sharedInstructions, buildHtmlName }) {
+  const token = (provider.token || '').trim();
+  if (!token) throw new Error('Paste your xAI API key in Settings.');
+  const model = grokModel(provider);
+  const res = await fetch('https://api.x.ai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: 'user', content: sharedInstructions }]
+    })
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`Grok API HTTP ${res.status}: ${errText.slice(0, 160)}`);
+  }
+  const data = await res.json();
+  const files = parseGeneratedOutput(data.choices?.[0]?.message?.content || '', target);
+  if (!files) throw new Error('Grok API did not return valid file blocks.');
+  if (files['index.html']) files[buildHtmlName] = files['index.html'];
+  return writeFilesToWorkspace(projDir, files);
+}
+
 async function compileWithGrokAccount({ provider, target, projDir, emit, sharedInstructions, buildHtmlName }) {
   const status = getGrokAuthStatus();
   if (!status.installed) {
@@ -953,7 +1125,7 @@ STRICT RULES (FOLLOW EXACTLY):
 
   if (provider.type === 'cli') {
     const cli = (provider.cli || 'codex').trim();
-    const chosenModel = provider.model && provider.model !== 'auto' ? provider.model.trim() : 'gpt-6-sol';
+    const chosenModel = resolveModelForProvider(provider);
 
     let rawOutput = '';
     if (cli === 'codex') {
@@ -965,23 +1137,12 @@ STRICT RULES (FOLLOW EXACTLY):
         '-s',
         'read-only',
         '-c',
-        'mcp_servers={}',
-        '-c',
-        'plugins={}',
-        '-c',
-        'notify=[]',
-        '-c',
-        'web_search=disabled',
-        '-c',
-        'features.memories=false',
-        '-c',
         'model_reasoning_effort=medium',
-        '-m',
-        chosenModel,
         '-o',
-        outFile,
-        '-'
+        outFile
       ];
+      if (chosenModel) args.push('-m', chosenModel);
+      args.push('-');
       try {
         const res = await runProcess({
           bin: codexBin,
@@ -996,37 +1157,41 @@ STRICT RULES (FOLLOW EXACTLY):
         try { if (fs.existsSync(outFile)) fs.unlinkSync(outFile); } catch {}
       }
     } else if (cli === 'gemini') {
-      const gemModel = chosenModel && chosenModel.startsWith('gemini') ? chosenModel : 'gemini-2.5-flash';
+      const gemModel = chosenModel || 'gemini-3.8-flash';
       const args = [
-        '-m',
-        gemModel,
         '--approval-mode',
         'plan',
-        '-e',
-        'none',
-        '--allowed-mcp-server-names',
-        'none',
+        '--output-format',
+        'text',
+        '-m',
+        gemModel,
         '-p',
         'Follow the instructions from stdin and output ONLY the ===FILE: index.html=== block.'
       ];
       const res = await runProcess({
-        bin: 'gemini',
+        bin: resolveCliBinary('gemini'),
         args,
         prompt: sharedInstructions,
         cwd: projDir,
         emit,
-        useShell: true
+        useShell: false
       });
       rawOutput = res.stdout;
     } else {
-      const args = chosenModel ? ['-m', chosenModel, '-p', '-'] : ['-p', '-'];
+      const args = [
+        '--permission-mode', 'plan',
+        '--max-turns', '1',
+        '--output-format', 'text'
+      ];
+      if (chosenModel) args.push('--model', chosenModel);
+      args.push('--print');
       const res = await runProcess({
-        bin: cli,
+        bin: resolveCliBinary(cli),
         args,
         prompt: sharedInstructions,
         cwd: projDir,
         emit,
-        useShell: true
+        useShell: false
       });
       rawOutput = res.stdout;
     }
@@ -1062,7 +1227,7 @@ STRICT RULES (FOLLOW EXACTLY):
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: provider.model && provider.model !== 'auto' ? provider.model : 'llama3.2',
+        model: await resolveOllamaModel(provider),
         stream: false,
         messages: [{ role: 'user', content: sharedInstructions }]
       })
@@ -1078,7 +1243,7 @@ STRICT RULES (FOLLOW EXACTLY):
   if (isGeminiApiProvider(provider)) {
     const token = (provider.token || '').trim();
     if (!token) throw new Error('Google Gemini API Key is required. Paste your key (starts with AIza...) in Settings.');
-    const model = provider.model && provider.model.startsWith('gemini') ? provider.model : 'gemini-2.5-flash';
+    const model = resolveModelForProvider(provider);
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(token)}`;
     const res = await fetch(url, {
       method: 'POST',
@@ -1100,6 +1265,9 @@ STRICT RULES (FOLLOW EXACTLY):
   }
 
   if (provider.type === 'grok') {
+    if ((provider.token || '').trim()) {
+      return compileWithGrokApi({ provider, target, projDir, sharedInstructions, buildHtmlName });
+    }
     return compileWithGrokAccount({ provider, target, projDir, emit, sharedInstructions, buildHtmlName });
   }
 
@@ -1108,7 +1276,7 @@ STRICT RULES (FOLLOW EXACTLY):
     const token = (provider.token || '').trim();
     const headers = { 'Content-Type': 'application/json' };
     if (token) headers.Authorization = `Bearer ${token}`;
-    const model = provider.model && provider.model !== 'auto' && !provider.model.includes('-sol') && !provider.model.includes('-luna') ? provider.model : 'gpt-4o-mini';
+    const model = resolveModelForProvider(provider);
     const res = await fetch(`${endpoint}/chat/completions`, {
       method: 'POST',
       headers,
@@ -1131,10 +1299,29 @@ STRICT RULES (FOLLOW EXACTLY):
   throw new Error(`Unknown provider type: ${provider.type}`);
 }
 
+function resolveProjectPath(projDir, relPath) {
+  const root = path.resolve(projDir);
+  const rel = String(relPath ?? '');
+  if (!rel || rel.includes('\0')) return null;
+  const resolved = path.resolve(root, rel);
+  const fromRoot = path.relative(root, resolved);
+  if (!fromRoot || fromRoot === '.' || fromRoot.startsWith('..') || path.isAbsolute(fromRoot)) return null;
+  return resolved;
+}
+
 function writeFilesToWorkspace(workspaceDir, files) {
-  const written = [];
+  const planned = [];
   for (const [relPath, content] of Object.entries(files)) {
-    const fullPath = path.join(workspaceDir, relPath);
+    const fullPath = resolveProjectPath(workspaceDir, relPath);
+    if (!fullPath) {
+      const err = new Error(`Refusing to write outside the project: ${relPath}`);
+      err.code = 'PATH-ESCAPE';
+      throw err;
+    }
+    planned.push({ relPath, fullPath, content });
+  }
+  const written = [];
+  for (const { relPath, fullPath, content } of planned) {
     fs.mkdirSync(path.dirname(fullPath), { recursive: true });
     const prev = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf-8') : null;
     if (prev !== content) {
@@ -1153,7 +1340,10 @@ module.exports = {
   validateHardMode,
   detectTarget,
   getCodexCatalog,
+  resolveProjectPath,
   resolveCodexBinary,
+  resolveCliBinary,
+  resolveModelForProvider,
   resolveGrokBinary,
   grokCliEnv,
   getGrokAuthStatus,

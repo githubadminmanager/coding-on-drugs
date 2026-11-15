@@ -127,7 +127,8 @@
             <label class="field">AI Engine Provider
               <select id="provider-type">
                 <option value="cli:codex" selected>ChatGPT (Codex)</option>
-                <option value="grok">Grok</option>
+                <option value="grok">Grok Account</option>
+                <option value="grok-api">Grok (xAI API Key)</option>
                 <option value="cli:gemini">Gemini CLI</option>
                 <option value="gemini-api">Gemini API Key</option>
                 <option value="openai-compatible">OpenAI API Key</option>
@@ -136,9 +137,11 @@
               </select>
             </label>
 
-            <select id="provider-model" style="display:none;">
-              <option value="auto" selected>Auto (Medium Effort)</option>
-            </select>
+            <label class="field" id="field-model" style="display:none;">Model
+              <select id="provider-model">
+                <option value="auto" selected>Account default</option>
+              </select>
+            </label>
 
             <label class="field" id="field-endpoint" style="display:none;">Endpoint URL
               <input id="provider-endpoint" type="text" value="http://localhost:11434" />

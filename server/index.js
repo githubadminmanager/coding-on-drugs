@@ -1,6 +1,8 @@
 const express = require('express');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { execFile } = require('child_process');
 const { runCommandInWorkspace, startBackgroundProcess, stopActiveProcess, isRunning } = require('./runner');
 const { buildZipBuffer, buildExeBuffer, getShareUrls } = require('./exporter');
 const {
@@ -9,7 +11,8 @@ const {
   validateHardMode,
   detectTarget,
   getCodexCatalog,
-  resolveCodexBinary,
+  resolveProjectPath,
+  resolveCliBinary,
   resolveGrokBinary,
   grokCliEnv,
   getGrokAuthStatus,
@@ -83,7 +86,7 @@ let aiProvider = {
   cli: 'codex',
   label: 'ChatGPT Account (Codex)',
   endpoint: 'local-cli',
-  model: 'gpt-6-sol',
+  model: 'auto',
   token: ''
 };
 
@@ -274,58 +277,83 @@ app.get('/api/projects', (req, res) => {
   });
 });
 
+function runGit(args) {
+  return new Promise((resolve, reject) => {
+    execFile('git', args, { timeout: 90000, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        const detail = String(stderr || stdout || err.message || 'git failed').trim();
+        const wrapped = new Error(detail.slice(0, 300) || 'git failed');
+        wrapped.code = err.code;
+        reject(wrapped);
+        return;
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+async function replaceProjectWithClone(owner, repo, projDir) {
+  const url = `https://github.com/${owner}/${repo}.git`;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cod-import-'));
+  const backup = `${projDir}.cod-backup-${process.pid}`;
+  try {
+    await runGit(['clone', '--depth', '1', '--', url, tmp]);
+    fs.rmSync(path.join(tmp, '.git'), { recursive: true, force: true });
+    const entries = fs.readdirSync(tmp);
+    if (!entries.length) throw new Error(`Repository ${owner}/${repo} cloned with no files.`);
+    if (fs.existsSync(backup)) fs.rmSync(backup, { recursive: true, force: true });
+    if (fs.existsSync(projDir)) fs.renameSync(projDir, backup);
+    try {
+      fs.cpSync(tmp, projDir, { recursive: true });
+    } catch (copyErr) {
+      if (!fs.existsSync(projDir) && fs.existsSync(backup)) fs.renameSync(backup, projDir);
+      throw copyErr;
+    }
+    if (fs.existsSync(backup)) fs.rmSync(backup, { recursive: true, force: true });
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+function firstImportedFile(projDir) {
+  for (const name of ['main.py', 'README.md', 'readme.md', 'README']) {
+    if (fs.existsSync(path.join(projDir, name))) return name;
+  }
+  const entries = fs.readdirSync(projDir).filter((name) => name !== '.git');
+  return entries[0] || 'README.md';
+}
+
 app.post('/api/repos/import', async (req, res) => {
   const rawInput = String(req.body?.repo || '').trim();
-  if (!rawInput) return res.status(400).json({ error: 'Enter a GitHub repository URL or user/repo name.' });
+  if (!rawInput) return res.status(400).json({ ok: false, error: 'Enter a GitHub repository URL or user/repo name.' });
 
-  // Check if it matches a starter repo id
   if (STARTER_REPOS[rawInput]) {
     ensureStarterRepos();
     return res.json({ ok: true, name: rawInput, file: 'main.py' });
   }
 
-  // Extract owner/repo from URL or slug
-  const ghMatch = rawInput.match(/(?:github\.com\/)?([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)/);
-  const slug = ghMatch ? `${ghMatch[1]}-${ghMatch[2].replace(/\.git$/, '')}` : rawInput.replace(/[^a-zA-Z0-9_-]/g, '-');
-  const safeName = slug.toLowerCase().slice(0, 48);
+  const ghMatch = rawInput.match(/^(?:https?:\/\/)?(?:www\.)?github\.com\/([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+?)(?:\.git)?\/?$|^([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+?)(?:\.git)?$/);
+  if (!ghMatch) {
+    return res.status(400).json({ ok: false, error: 'Enter a GitHub repository as owner/repo or a GitHub URL.' });
+  }
+  const owner = ghMatch[1] || ghMatch[3];
+  const repo = (ghMatch[2] || ghMatch[4] || '').replace(/\.git$/, '');
+  if (!owner || !repo || owner === '.' || repo === '.' || owner === '..' || repo === '..') {
+    return res.status(400).json({ ok: false, error: 'Enter a GitHub repository as owner/repo or a GitHub URL.' });
+  }
+  const safeName = `${owner}-${repo}`.toLowerCase().replace(/[^a-z0-9._-]/g, '-').slice(0, 48);
   const projDir = path.join(WORKSPACES_DIR, safeName);
-  fs.mkdirSync(projDir, { recursive: true });
-
-  let repoDesc = `Imported repository ${rawInput}`;
-  let topics = 'interactive, 3d, high_fps';
-  if (ghMatch) {
-    try {
-      const apiRes = await fetch(`https://api.github.com/repos/${ghMatch[1]}/${ghMatch[2].replace(/\.git$/, '')}`, {
-        headers: { 'User-Agent': 'CodingOnDrugs-IDE' }
-      });
-      if (apiRes.ok) {
-        const meta = await apiRes.json();
-        if (meta.description) repoDesc = meta.description;
-        if (Array.isArray(meta.topics) && meta.topics.length) topics = meta.topics.join(', ');
-      }
-    } catch {}
+  try {
+    await replaceProjectWithClone(owner, repo, projDir);
+  } catch (err) {
+    return res.status(502).json({
+      ok: false,
+      error: err && err.code === 'ENOENT'
+        ? 'git is not installed, so the repository could not be cloned.'
+        : `Could not fetch ${owner}/${repo}. ${err.message}`
+    });
   }
-
-  const mainPyPath = path.join(projDir, 'main.py');
-  if (!fs.existsSync(mainPyPath)) {
-    const starterCode = `# Cloned Repository: ${rawInput}
-# ${repoDesc}
-import repo_core, graphics_engine, physics
-
-repo = "${rawInput}"
-features = ${topics}
-graphics = 3d good
-
-# Override & mod repository variables below:
-me = player
-speed = fast
-guns = faster
-physics = realistic
-`;
-    fs.writeFileSync(mainPyPath, starterCode, 'utf-8');
-  }
-
-  res.json({ ok: true, name: safeName, file: 'main.py' });
+  res.json({ ok: true, name: safeName, file: firstImportedFile(projDir) });
 });
 
 app.post('/api/projects', (req, res) => {
@@ -356,8 +384,9 @@ app.get('/api/projects/:name/file', (req, res) => {
   const safeProject = path.basename(req.params.name);
   const projDir = path.join(WORKSPACES_DIR, safeProject);
   const relPath = String(req.query.path || '');
-  const fullPath = path.resolve(projDir, relPath);
-  if (!fullPath.startsWith(projDir) || !fs.existsSync(fullPath)) {
+  const fullPath = resolveProjectPath(projDir, relPath);
+  if (!fullPath) return res.status(403).json({ error: 'Forbidden' });
+  if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) {
     return res.status(404).json({ error: 'File not found' });
   }
   const buildHtmlName = getBuildHtmlName(relPath);
@@ -370,8 +399,8 @@ app.put('/api/projects/:name/file', (req, res) => {
   const projDir = path.join(WORKSPACES_DIR, path.basename(req.params.name));
   const relPath = String(req.body?.path || '');
   const content = String(req.body?.content ?? '');
-  const fullPath = path.resolve(projDir, relPath);
-  if (!fullPath.startsWith(projDir)) return res.status(403).json({ error: 'Forbidden' });
+  const fullPath = resolveProjectPath(projDir, relPath);
+  if (!fullPath) return res.status(403).json({ error: 'Forbidden' });
   fs.mkdirSync(path.dirname(fullPath), { recursive: true });
   fs.writeFileSync(fullPath, content, 'utf-8');
   res.json({ ok: true });
@@ -381,8 +410,8 @@ app.delete('/api/projects/:name/folder', (req, res) => {
   const projDir = path.join(WORKSPACES_DIR, path.basename(req.params.name));
   const relPath = String(req.query.path || '').trim();
   if (!relPath) return res.status(400).json({ error: 'Folder path is required' });
-  const fullPath = path.resolve(projDir, relPath);
-  if (!fullPath.startsWith(projDir + path.sep) || fullPath === projDir) {
+  const fullPath = resolveProjectPath(projDir, relPath);
+  if (!fullPath) {
     return res.status(403).json({ error: 'Forbidden' });
   }
   if (!fs.existsSync(fullPath)) return res.status(404).json({ error: 'Folder not found' });
@@ -394,8 +423,8 @@ app.delete('/api/projects/:name/file', (req, res) => {
   const projDir = path.join(WORKSPACES_DIR, path.basename(req.params.name));
   const relPath = String(req.query.path || '').trim();
   if (!relPath) return res.status(400).json({ error: 'File path is required' });
-  const fullPath = path.resolve(projDir, relPath);
-  if (!fullPath.startsWith(projDir + path.sep)) {
+  const fullPath = resolveProjectPath(projDir, relPath);
+  if (!fullPath) {
     return res.status(403).json({ error: 'Forbidden' });
   }
   if (!fs.existsSync(fullPath)) return res.status(404).json({ error: 'File not found' });
@@ -473,7 +502,7 @@ app.post('/api/provider/test', async (req, res) => {
     const result = await testAIProvider(candidate);
     res.json(result);
   } catch (err) {
-    res.status(400).json({ ok: false, message: err.message });
+    res.json({ ok: false, message: err.message });
   }
 });
 
@@ -482,14 +511,15 @@ let activeLoginProc = null;
 app.post('/api/cli/login', (req, res) => {
   const { execFile, spawn } = require('child_process');
   const requested = req.body?.cli;
-  const cli = requested === 'gemini' ? 'gemini' : requested === 'grok' ? 'grok' : 'codex';
-  const bin = cli === 'codex' ? resolveCodexBinary() : cli === 'grok' ? resolveGrokBinary() : 'gemini';
-  const args = cli === 'codex' ? ['login'] : cli === 'grok' ? ['login', '--oauth'] : [];
+  const allowedCli = new Set(['codex', 'grok', 'gemini', 'claude']);
+  const cli = allowedCli.has(requested) ? requested : 'codex';
+  const bin = resolveCliBinary(cli);
+  const args = cli === 'codex' ? ['login'] : cli === 'grok' ? ['login', '--oauth'] : cli === 'claude' ? ['auth', 'login'] : [];
 
   if (cli === 'grok') {
     const status = getGrokAuthStatus();
     if (!status.installed) {
-      return res.status(400).json({
+      return res.json({
         ok: false,
         message: 'Grok CLI is not installed. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash'
       });
@@ -526,7 +556,7 @@ app.post('/api/cli/login', (req, res) => {
     child.on('error', (err) => {
       if (!responded) {
         responded = true;
-        res.status(400).json({
+        res.json({
           ok: false,
           message: err.code === 'ENOENT'
             ? 'Grok CLI is not installed. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash'
@@ -582,7 +612,7 @@ app.post('/api/cli/login', (req, res) => {
     child.on('error', (err) => {
       if (!responded) {
         responded = true;
-        res.status(400).json({
+        res.json({
           ok: false,
           message: `Codex CLI could not start: ${err.message}`
         });
@@ -609,14 +639,19 @@ app.post('/api/cli/login', (req, res) => {
     return;
   }
 
-  execFile(bin, ['--version'], { shell: true, timeout: 4000 }, (err) => {
+  execFile(bin, ['--version'], { timeout: 4000 }, (err) => {
     if (err) {
-      return res.status(400).json({
+      const hint = cli === 'gemini'
+        ? 'Install it with: npm i -g @google/gemini-cli'
+        : cli === 'claude'
+          ? 'Install Claude Code, then run: claude auth login'
+          : `Install the "${cli}" CLI first.`;
+      return res.json({
         ok: false,
-        message: `"${cli}" CLI is not installed. Run "npm i -g @google/gemini-cli" in a terminal first.`
+        message: `"${cli}" CLI is not installed. ${hint}`
       });
     }
-    const child = spawn(bin, args, { shell: true, detached: true, stdio: 'ignore' });
+    const child = spawn(bin, args, { detached: true, stdio: 'ignore' });
     child.unref();
     res.json({
       ok: true,
@@ -644,8 +679,24 @@ app.post('/api/stop', (req, res) => {
   res.json({ ok: true });
 });
 
+function providerFromCompileRequest(body) {
+  const sent = body && body.provider;
+  if (!sent || typeof sent !== 'object' || !sent.type) return null;
+  const cli = String(sent.cli || '').trim();
+  const type = String(sent.type).trim();
+  return {
+    type,
+    cli,
+    label: String(sent.label || cli || type).trim(),
+    endpoint: sent.endpoint || '',
+    model: sent.model || 'auto',
+    token: typeof sent.token === 'string' ? sent.token : ''
+  };
+}
+
 app.post('/api/compile', async (req, res) => {
   const { project = DEFAULT_PROJECT, file = 'main.py', source, mode = 'smart', target = 'auto' } = req.body || {};
+  const compileProvider = providerFromCompileRequest(req.body) || aiProvider;
   const safeProject = path.basename(project);
   const safeFile = path.basename(file || 'main.py');
   const projDir = path.join(WORKSPACES_DIR, safeProject);
@@ -692,7 +743,7 @@ app.post('/api/compile', async (req, res) => {
     if (!written) {
       try {
         written = await compileWithAI({
-          provider: aiProvider,
+          provider: compileProvider,
           ir,
           source: userSource,
           activeFile: safeFile,
@@ -701,7 +752,7 @@ app.post('/api/compile', async (req, res) => {
           emit
         });
       } catch (err) {
-        const msg = `${aiProvider.label} error: ${err.message}`;
+        const msg = `${compileProvider.label} error: ${err.message}`;
         const diags = err.diagnostics || [{ severity: 'error', line: 1, code: 'AI-ERROR', message: msg }];
         stage('compile', 'Compilation Failed', 'error', '');
         emit('terminal', { stream: 'stderr', text: `[ai-error] ${msg}\r\n` });

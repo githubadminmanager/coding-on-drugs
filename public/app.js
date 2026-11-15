@@ -724,7 +724,7 @@ async function callBrowserAI(provider, promptText) {
   const isGem = provider.type === 'gemini-api' || tok.startsWith('AIza') || (provider.endpoint || '').includes('googleapis.com');
   if (isGem) {
     if (!tok) throw new Error('Paste your Google Gemini API key (starts with AIza...) in Settings -> API Key.');
-    const model = provider.model && provider.model.startsWith('gemini') ? provider.model : 'gemini-2.5-flash';
+    const model = provider.model && String(provider.model).startsWith('gemini') ? provider.model : 'gemini-3.8-flash';
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(tok)}`;
     const res = await fetch(url, {
       method: 'POST',
@@ -741,10 +741,18 @@ async function callBrowserAI(provider, promptText) {
 
   if (provider.type === 'ollama') {
     const ep = (provider.endpoint || 'http://localhost:11434').replace(/\/$/, '');
+    let model = (provider.model || '').trim();
+    if (!model || model === 'auto') {
+      const tags = await fetch(`${ep}/api/tags`);
+      if (!tags.ok) throw new Error(`Ollama HTTP ${tags.status}`);
+      const listed = await tags.json();
+      model = (listed.models || []).map((m) => m.name).find(Boolean) || '';
+      if (!model) throw new Error('Ollama has no models installed. Pull one with: ollama pull qwen2.5-coder');
+    }
     const res = await fetch(`${ep}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: provider.model || 'llama3.2', stream: false, messages: [{ role: 'user', content: promptText }] })
+      body: JSON.stringify({ model, stream: false, messages: [{ role: 'user', content: promptText }] })
     });
     if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`);
     const data = await res.json();
@@ -752,13 +760,29 @@ async function callBrowserAI(provider, promptText) {
   }
 
   if (provider.type === 'grok') {
-    throw new Error('Grok uses browser sign-in. Start the local server with npm start, then click Sign in with Grok.');
+    if (!tok) {
+      throw new Error('Grok account compiles run on the local server. Start it with npm start, then click Sign in with Grok.');
+    }
+    const model = provider.model && String(provider.model).startsWith('grok-') ? provider.model : 'grok-4.7';
+    const res = await fetch('https://api.x.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: promptText }] })
+    });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(`Grok API HTTP ${res.status}: ${errText.slice(0, 140)}`);
+    }
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content || '';
   }
 
   if (provider.type === 'openai-compatible') {
     if (!tok) throw new Error('Paste your API Key in Settings -> API Key first.');
     const ep = (provider.endpoint || 'https://api.openai.com/v1').replace(/\/$/, '');
-    const model = provider.model && !provider.model.includes('-sol') && !provider.model.includes('-luna') ? provider.model : 'gpt-4o-mini';
+    const rawModel = (provider.model || '').trim();
+    const foreign = !rawModel || rawModel === 'auto' || /^(grok|gemini|claude)/.test(rawModel);
+    const model = foreign ? 'gpt-4o-mini' : rawModel;
     const res = await fetch(`${ep}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` },
@@ -926,35 +950,39 @@ function resolvePreviewUrl(url) {
   return url;
 }
 
+async function responseBody(res) {
+  const text = await res.text();
+  if (!text) return { ok: false, error: res.statusText || `HTTP ${res.status}` };
+  try {
+    const data = JSON.parse(text);
+    if (data && typeof data === 'object') return data;
+    return { ok: false, error: String(data) };
+  } catch {
+    return { ok: false, error: text };
+  }
+}
+
 async function api(url, opts = {}) {
   const isGithubPages = window.location.hostname.endsWith('github.io');
-  if (!isGithubPages) {
+  const targets = isGithubPages ? [] : [url];
+  targets.push(`http://localhost:4321${url}`);
+  let reached = false;
+  for (const target of targets) {
     try {
-      const res = await fetch(url, {
+      const res = await fetch(target, {
         headers: { 'Content-Type': 'application/json' },
         ...opts
       });
+      reached = true;
+      if (String(target).startsWith('http://localhost:4321')) state.backendOrigin = 'http://localhost:4321';
       if (res.ok) return await res.json();
+      return responseBody(res);
     } catch (err) {
       if (err.name === 'AbortError') throw err;
     }
   }
-
-  // Try local backend at http://localhost:4321 (allows ChatGPT Codex CLI to work even when opened via github.io)
-  try {
-    const localRes = await fetch(`http://localhost:4321${url}`, {
-      headers: { 'Content-Type': 'application/json' },
-      ...opts
-    });
-    if (localRes.ok) {
-      state.backendOrigin = 'http://localhost:4321';
-      return await localRes.json();
-    }
-  } catch (err) {
-    if (err.name === 'AbortError') throw err;
-  }
-
-  return handleStaticApi(url, opts);
+  if (!reached) return handleStaticApi(url, opts);
+  return { ok: false, error: 'Local server returned an empty failure.' };
 }
 
 async function switchRepo(repoName) {
@@ -1037,10 +1065,14 @@ if (el('btn-repo-import')) {
         await switchRepo(res.name);
         const expBtn = document.querySelector('.act-btn[data-side="explorer"]');
         if (expBtn) expBtn.click();
+      } else if (el('btn-repo-import')) {
+        el('btn-repo-import').textContent = res.error || res.message || 'Import failed';
       }
     } finally {
       el('btn-repo-import').disabled = false;
-      el('btn-repo-import').textContent = 'Clone & Open in Editor';
+      if (el('btn-repo-import').textContent === 'Cloning...') {
+        el('btn-repo-import').textContent = 'Clone & Open in Editor';
+      }
     }
   };
 }
@@ -1534,7 +1566,14 @@ async function compileAndRun() {
     result = await api('/api/compile', {
       method: 'POST',
       signal: state.compileAbort.signal,
-      body: JSON.stringify({ project: state.project, file: targetPyFile, source, mode, target: 'auto' })
+      body: JSON.stringify({
+        project: state.project,
+        file: targetPyFile,
+        source,
+        mode,
+        target: 'auto',
+        provider: parseProviderPayload()
+      })
     });
   } catch (err) {
     if (err.name === 'AbortError') return;
@@ -1888,6 +1927,7 @@ if (el('btn-open-external')) {
 // AI Provider / Account & Model Connection
 let codexLoggedIn = false;
 let grokLoggedIn = false;
+let codexCatalogModels = [];
 let grokAuthUpdatedAt = 0;
 let loginPollTimer = null;
 
@@ -1966,45 +2006,52 @@ window.addEventListener('click', () => {
 
 const MODEL_OPTIONS = {
   'cli:codex': [
-    { value: 'gpt-6.1-sol', label: 'gpt-6.1-sol', shortLabel: 'gpt-6.1-sol' },
-    { value: 'gpt-6-astra', label: 'gpt-6-astra', shortLabel: 'gpt-6-astra' },
-    { value: 'gpt-6.1-terra', label: 'gpt-6.1-terra', shortLabel: 'gpt-6.1-terra' },
-    { value: 'gpt-6-sol', label: 'gpt-6-sol', shortLabel: 'gpt-6-sol' },
-    { value: 'gpt-reserve', label: 'gpt-reserve', shortLabel: 'gpt-reserve' },
-    { value: 'gpt-6-luna', label: 'gpt-6-luna', shortLabel: 'gpt-6-luna' },
-    { value: 'gpt-5.6-sol', label: 'gpt-5.6-sol', shortLabel: 'gpt-5.6-sol' },
-    { value: 'gpt-5.6-terra', label: 'gpt-5.6-terra', shortLabel: 'gpt-5.6-terra' },
-    { value: 'gpt-5.6-luna', label: 'gpt-5.6-luna', shortLabel: 'gpt-5.6-luna' }
+    { value: 'auto', label: 'Account default' }
+  ],
+  grok: [
+    { value: 'grok-4.7', label: 'grok-4.7' },
+    { value: 'grok-4.6', label: 'grok-4.6' },
+    { value: 'grok-4.5', label: 'grok-4.5' }
+  ],
+  'grok-api': [
+    { value: 'grok-4.7', label: 'grok-4.7' },
+    { value: 'grok-4.6', label: 'grok-4.6' },
+    { value: 'grok-4.5', label: 'grok-4.5' }
   ],
   'cli:gemini': [
-    { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash', shortLabel: 'gemini-2.5-flash' },
-    { value: 'gemini-2.5-pro', label: 'gemini-2.5-pro', shortLabel: 'gemini-2.5-pro' }
+    { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash' },
+    { value: 'gemini-4-argon', label: 'gemini-4-argon' },
+    { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash' }
   ],
   'gemini-api': [
-    { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash', shortLabel: 'gemini-2.5-flash' },
-    { value: 'gemini-2.5-pro', label: 'gemini-2.5-pro', shortLabel: 'gemini-2.5-pro' },
-    { value: 'gemini-2.0-flash', label: 'gemini-2.0-flash', shortLabel: 'gemini-2.0-flash' }
+    { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash' },
+    { value: 'gemini-4-argon', label: 'gemini-4-argon' },
+    { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash' }
   ],
   'cli:claude': [
-    { value: 'claude-sonnet-4-20250514', label: 'claude-sonnet-4', shortLabel: 'claude-sonnet-4' },
-    { value: 'claude-opus-4-20250514', label: 'claude-opus-4', shortLabel: 'claude-opus-4' }
+    { value: 'sonnet', label: 'sonnet' },
+    { value: 'opus', label: 'opus' },
+    { value: 'haiku', label: 'haiku' },
+    { value: 'claude-sonnet-5-5', label: 'claude-sonnet-5-5' },
+    { value: 'claude-opus-5-5', label: 'claude-opus-5-5' }
   ],
   ollama: [
-    { value: 'llama3.2', label: 'llama3.2', shortLabel: 'llama3.2' },
-    { value: 'qwen2.5-coder:7b', label: 'qwen2.5-coder:7b', shortLabel: 'qwen2.5-coder:7b' },
-    { value: 'deepseek-coder-v2', label: 'deepseek-coder-v2', shortLabel: 'deepseek-coder-v2' }
+    { value: 'auto', label: 'First installed model' },
+    { value: 'qwen2.5-coder:7b', label: 'qwen2.5-coder:7b' }
   ],
   'openai-compatible': [
-    { value: 'gpt-4o-mini', label: 'gpt-4o-mini', shortLabel: 'gpt-4o-mini' },
-    { value: 'gpt-4o', label: 'gpt-4o', shortLabel: 'gpt-4o' },
-    { value: 'o3-mini', label: 'o3-mini', shortLabel: 'o3-mini' }
+    { value: 'gpt-4o-mini', label: 'gpt-4o-mini' },
+    { value: 'gpt-4o', label: 'gpt-4o' }
   ]
 };
 
 function providerSelectValue(info) {
   if (!info) return '';
   if (info.selectValue) return info.selectValue;
-  if (info.type === 'grok') return 'grok';
+  if (info.type === 'grok') {
+    if (info.hasToken || String(info.endpoint || '').includes('api.x.ai')) return 'grok-api';
+    return 'grok';
+  }
   if (info.type === 'cli') return `cli:${info.cli || 'codex'}`;
   return info.type || '';
 }
@@ -2039,20 +2086,63 @@ function restoreProviderForm(choice) {
   return true;
 }
 
+function fillModelOptions(rawType) {
+  const select = el('provider-model');
+  const field = el('field-model');
+  if (!select || !field) return;
+  const options = (MODEL_OPTIONS[rawType] || []).map((opt) => ({ ...opt }));
+  if (rawType === 'cli:codex' && codexCatalogModels.length) {
+    const seen = new Set(options.map((opt) => opt.value));
+    for (const model of codexCatalogModels) {
+      if (!model || !model.value || seen.has(model.value)) continue;
+      seen.add(model.value);
+      options.push({ value: model.value, label: model.shortLabel || model.value });
+    }
+  }
+  const saved = readSavedProviderChoice();
+  const previous = select.value;
+  select.innerHTML = '';
+  for (const opt of options) {
+    const node = document.createElement('option');
+    node.value = opt.value;
+    node.textContent = opt.label;
+    select.appendChild(node);
+  }
+  const wanted = saved && providerSelectValue(saved) === rawType ? saved.model : '';
+  const pick = [wanted, previous].find((value) => value && Array.from(select.options).some((opt) => opt.value === value));
+  if (pick) select.value = pick;
+  field.style.display = options.length ? 'flex' : 'none';
+  upgradeCustomSelect(select);
+}
+
+function selectedModel() {
+  const node = el('provider-model');
+  const field = el('field-model');
+  if (!node || !field || field.style.display === 'none') return '';
+  return (node.value || '').trim();
+}
+
 function parseProviderPayload() {
   const rawType = el('provider-type').value;
   const label = el('provider-type').options[el('provider-type').selectedIndex]?.text || rawType;
   const endpoint = el('provider-endpoint').value;
   const token = el('provider-token').value;
+  const model = selectedModel();
 
   if (rawType.startsWith('cli:')) {
     const cliName = rawType.split(':')[1];
-    return { type: 'cli', cli: cliName, model: 'auto', label, endpoint: 'local-cli', token: '' };
+    return { type: 'cli', cli: cliName, model: model || 'auto', label, endpoint: 'local-cli', token: '' };
   }
-  if (rawType === 'grok') {
-    return { type: 'grok', model: 'grok-4.7', label, endpoint: 'grok-oauth', token: '' };
+  if (rawType === 'grok' || rawType === 'grok-api') {
+    return {
+      type: 'grok',
+      model: model || 'grok-4.7',
+      label,
+      endpoint: rawType === 'grok-api' ? 'https://api.x.ai/v1' : 'grok-oauth',
+      token: rawType === 'grok-api' ? token : ''
+    };
   }
-  return { type: rawType, model: 'auto', label, endpoint, token };
+  return { type: rawType, model: model || 'auto', label, endpoint, token };
 }
 
 async function applyAndSaveProvider() {
@@ -2063,17 +2153,18 @@ async function applyAndSaveProvider() {
   });
   await api('/api/provider', { method: 'POST', body: JSON.stringify(payload) });
   if (el('status-provider')) el('status-provider').textContent = `Engine: ${payload.label}`;
-  if (payload.type === 'grok') {
+  const modelLabel = el('provider-model')?.selectedOptions?.[0]?.textContent || payload.model;
+  if (payload.type === 'grok' && payload.endpoint === 'grok-oauth') {
     el('provider-status').style.color = grokLoggedIn ? '#59a869' : '#a3a3a3';
     el('provider-status').textContent = grokLoggedIn
-      ? 'Grok signed in • grok-4.7'
+      ? `Grok signed in • ${payload.model}`
       : 'Not signed in — click Sign in with Grok.';
   } else if (payload.type === 'cli' && payload.cli === 'codex' && !codexLoggedIn) {
     el('provider-status').style.color = '#a3a3a3';
     el('provider-status').textContent = 'Not signed in — click Connect ChatGPT above.';
   } else {
     el('provider-status').style.color = '#59a869';
-    el('provider-status').textContent = `${payload.label} • Auto (Medium Effort)`;
+    el('provider-status').textContent = `${payload.label} • ${modelLabel}`;
   }
 }
 
@@ -2084,9 +2175,15 @@ async function syncProviderUI() {
   } else if (t === 'openai-compatible' && el('provider-endpoint').value.includes('11434')) {
     el('provider-endpoint').value = 'https://api.openai.com/v1';
   }
+  fillModelOptions(t);
   el('field-endpoint').style.display = t === 'ollama' || t === 'openai-compatible' ? 'flex' : 'none';
-  el('field-token').style.display = t === 'gemini-api' || t === 'openai-compatible' ? 'flex' : 'none';
-  el('provider-token').placeholder = t === 'gemini-api' ? 'Paste Gemini API key (AIza...)' : 'Paste API key (sk-...)';
+  const needsToken = t === 'gemini-api' || t === 'openai-compatible' || t === 'grok-api';
+  el('field-token').style.display = needsToken ? 'flex' : 'none';
+  el('provider-token').placeholder = t === 'gemini-api'
+    ? 'Paste Gemini API key (AIza...)'
+    : t === 'grok-api'
+      ? 'Paste xAI API key'
+      : 'Paste API key (sk-...)';
   if (el('btn-cli-login')) {
     el('btn-cli-login').style.display = t.startsWith('cli:') || t === 'grok' ? 'inline-flex' : 'none';
     el('btn-cli-login').textContent = t === 'grok'
@@ -2215,6 +2312,7 @@ async function initProviderCatalog() {
     info = await api('/api/provider');
     if (info.codexCatalog) {
       codexLoggedIn = Boolean(info.codexCatalog.loggedIn);
+      codexCatalogModels = Array.isArray(info.codexCatalog.models) ? info.codexCatalog.models : [];
     }
     if (info.grokAuth) {
       grokLoggedIn = Boolean(info.grokAuth.loggedIn);
