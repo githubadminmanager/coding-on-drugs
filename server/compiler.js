@@ -535,7 +535,10 @@ function runProcess({ bin, args, prompt, cwd, emit, useShell = false, timeoutMs 
 }
 
 function extractGrokStreamText(raw) {
-  const parts = [];
+  const deltas = [];
+  const legacy = [];
+  let resultText = '';
+  let resultError = '';
   for (const line of String(raw || '').split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed.startsWith('{')) continue;
@@ -545,9 +548,28 @@ function extractGrokStreamText(raw) {
     } catch {
       continue;
     }
-    if (event.type === 'text' && typeof event.data === 'string') parts.push(event.data);
+    if (event.type === 'text' && typeof event.data === 'string') legacy.push(event.data);
+    const delta = event.type === 'stream_event' && event.event && event.event.delta;
+    if (delta && delta.type === 'text_delta' && typeof delta.text === 'string') deltas.push(delta.text);
+    if (event.type === 'result') {
+      if (event.is_error && typeof event.result === 'string') resultError = event.result;
+      else if (typeof event.result === 'string') resultText = event.result;
+    }
   }
-  return parts.join('');
+  return {
+    text: resultText || (deltas.length ? deltas.join('') : legacy.join('')),
+    error: resultError
+  };
+}
+
+function grokStreamTerminalText(event) {
+  if (!event || typeof event !== 'object') return null;
+  if (event.type === 'text' && typeof event.data === 'string') return { kind: 'text', text: event.data };
+  if (event.type === 'thought') return { kind: 'thought' };
+  const delta = event.type === 'stream_event' && event.event && event.event.delta;
+  if (delta && delta.type === 'thinking_delta') return { kind: 'thought' };
+  if (delta && delta.type === 'text_delta' && typeof delta.text === 'string') return { kind: 'text', text: delta.text };
+  return null;
 }
 
 function runGrokHeadless({ bin, args, cwd, emit, env, timeoutMs = 180000 }) {
@@ -584,9 +606,10 @@ function runGrokHeadless({ bin, args, cwd, emit, env, timeoutMs = 180000 }) {
         } catch {
           continue;
         }
-        if (event.type === 'text' && typeof event.data === 'string') {
-          emit('terminal', { stream: 'stdout', text: event.data });
-        } else if (event.type === 'thought' && !thoughtNoted) {
+        const piece = grokStreamTerminalText(event);
+        if (piece && piece.kind === 'text') {
+          emit('terminal', { stream: 'stdout', text: piece.text });
+        } else if (piece && piece.kind === 'thought' && !thoughtNoted) {
           thoughtNoted = true;
           emit('terminal', { stream: 'system', text: '[grok] thinking...\r\n' });
         }
@@ -612,10 +635,12 @@ function runGrokHeadless({ bin, args, cwd, emit, env, timeoutMs = 180000 }) {
     proc.on('close', (code) => {
       clearTimeout(timer);
       if (activeBuildProc === proc) activeBuildProc = null;
-      if (code !== 0 && !stdout.trim()) {
+      const parsed = extractGrokStreamText(stdout);
+      if (parsed.error) return reject(new Error(parsed.error));
+      if (code !== 0 && !parsed.text.trim()) {
         return reject(new Error(stderr.trim() || `Grok exited with code ${code}`));
       }
-      resolve({ stdout, stderr, code, text: extractGrokStreamText(stdout) });
+      resolve({ stdout, stderr, code, text: parsed.text });
     });
   });
 }
@@ -788,6 +813,54 @@ function tryDirectCodeExecution(source, projDir, emit, activeFile = 'main.py') {
   });
 }
 
+async function compileWithGrokAccount({ provider, target, projDir, emit, sharedInstructions, buildHtmlName }) {
+  const status = getGrokAuthStatus();
+  if (!status.installed) {
+    throw new Error('Grok CLI is not installed. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash');
+  }
+  if (!status.loggedIn) {
+    throw new Error('Grok is not signed in. Click Sign in with Grok in Settings.');
+  }
+  const model = grokModel(provider);
+  const promptFile = path.join(os.tmpdir(), `cod-grok-${Date.now()}.txt`);
+  fs.writeFileSync(promptFile, sharedInstructions, 'utf8');
+  try {
+    let result;
+    try {
+      result = await runGrokHeadless({
+        bin: resolveGrokBinary(),
+        args: [
+          '--no-auto-update',
+          '--no-alt-screen',
+          '--verbatim',
+          '--disable-web-search',
+          '--no-subagents',
+          '--max-turns', '1',
+          '--reasoning-effort', 'low',
+          '-m', model,
+          '--output-format', 'streaming-messages-json',
+          '--include-partial-messages',
+          '--prompt-file', promptFile
+        ],
+        cwd: projDir,
+        emit,
+        env: grokCliEnv()
+      });
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        throw new Error('Grok CLI is not installed. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash');
+      }
+      throw err;
+    }
+    const files = parseGeneratedOutput(result.text || result.stdout, target);
+    if (!files) throw new Error('Grok did not return valid file blocks.');
+    if (files['index.html']) files[buildHtmlName] = files['index.html'];
+    return writeFilesToWorkspace(projDir, files);
+  } finally {
+    try { fs.unlinkSync(promptFile); } catch {}
+  }
+}
+
 async function compileWithAI({ provider, ir, source, activeFile = 'main.py', target, projDir, emit }) {
   if (!provider) throw new Error('No AI engine configured.');
 
@@ -873,6 +946,10 @@ STRICT RULES (FOLLOW EXACTLY):
 <!DOCTYPE html>
 ...
 ===END FILE===`;
+
+  if (provider.type === 'cli' && (provider.cli || '').trim() === 'grok') {
+    return compileWithGrokAccount({ provider, target, projDir, emit, sharedInstructions, buildHtmlName });
+  }
 
   if (provider.type === 'cli') {
     const cli = (provider.cli || 'codex').trim();
@@ -1023,49 +1100,7 @@ STRICT RULES (FOLLOW EXACTLY):
   }
 
   if (provider.type === 'grok') {
-    const status = getGrokAuthStatus();
-    if (!status.installed) {
-      throw new Error('Grok CLI is not installed. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash');
-    }
-    if (!status.loggedIn) {
-      throw new Error('Grok is not signed in. Click Sign in with Grok in Settings.');
-    }
-    const model = grokModel(provider);
-    const promptFile = path.join(os.tmpdir(), `cod-grok-${Date.now()}.txt`);
-    fs.writeFileSync(promptFile, sharedInstructions, 'utf8');
-    try {
-      let result;
-      try {
-        result = await runGrokHeadless({
-          bin: resolveGrokBinary(),
-          args: [
-            '--no-auto-update',
-            '--no-alt-screen',
-            '--verbatim',
-            '--disable-web-search',
-            '--max-turns', '1',
-            '--reasoning-effort', 'low',
-            '-m', model,
-            '--output-format', 'streaming-json',
-            '--prompt-file', promptFile
-          ],
-          cwd: projDir,
-          emit,
-          env: grokCliEnv()
-        });
-      } catch (err) {
-        if (err && err.code === 'ENOENT') {
-          throw new Error('Grok CLI is not installed. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash');
-        }
-        throw err;
-      }
-      const files = parseGeneratedOutput(result.text || result.stdout, target);
-      if (!files) throw new Error('Grok did not return valid file blocks.');
-      if (files['index.html']) files[buildHtmlName] = files['index.html'];
-      return writeFilesToWorkspace(projDir, files);
-    } finally {
-      try { fs.unlinkSync(promptFile); } catch {}
-    }
+    return compileWithGrokAccount({ provider, target, projDir, emit, sharedInstructions, buildHtmlName });
   }
 
   if (provider.type === 'openai-compatible') {
